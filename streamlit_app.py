@@ -1,56 +1,135 @@
 import streamlit as st
-from openai import OpenAI
+import requests
+import time
+import pandas as pd 
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# === CONFIG ===
+DATABRICKS_INSTANCE = "adb-5264822104976956.16.azuredatabricks.net"
+SPACE_ID = "01f01f62db311ee28190e4d40e204314"
+TOKEN = "dapi86341d8576e3324ae97ef589b00a87b5"  # Store your PAT in Streamlit secrets
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+API_BASE = f"https://{DATABRICKS_INSTANCE}/api/2.0/genie/spaces/{SPACE_ID}"
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json"
+}
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# === UI SETUP ===
+st.set_page_config(page_title="Chat with Genie", layout="centered")
+st.title("Chat with Databricks Genie")
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# === SESSION STATE ===
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "conv_id" not in st.session_state:
+    st.session_state.conv_id = None
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+df = pd.DataFrame()  # Initialize empty DataFrame for results
+df_data = []  # List to store DataFrames for each response
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+# === USER INPUT ===
+user_input = st.chat_input("Ask Genie...")
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+if user_input:
+    # === DISPLAY CHAT HISTORY ===
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            st.dataframe(df_data[m], use_container_width=True)
+            
+                
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    
+    # Display user input in chat
+    with st.chat_message("user"):
+        st.markdown(user_input)
+    
+    # Step 1: Start conversation or continue
+    if not st.session_state.conv_id:
+        url = f"{API_BASE}/start-conversation"
+    else:
+        url = f"{API_BASE}/conversations/{st.session_state.conv_id}/messages"
+        st.write("Continuing conversation...") # Debugging line
+        
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    payload = {"content": user_input}
+
+    with st.spinner("Genie is thinking..."):
+        response = requests.post(url, headers=HEADERS, json=payload)
+        if response.status_code != 200:
+            st.error("Failed to send message to Genie")
+            st.text(response.text)
+            st.stop()
+
+        data = response.json()
+        st.session_state.conv_id = data["conversation_id"]
+        message_id = data["message_id"]
+
+        # Step 2: Poll for completion
+        poll_url = f"{API_BASE}/conversations/{st.session_state.conv_id}/messages/{message_id}"
+
+        status = "SUBMITTED"
+        while status not in ("COMPLETED", "FAILED", "CANCELLED"):
+            time.sleep(2)
+            poll_resp = requests.get(poll_url, headers=HEADERS)
+            message = poll_resp.json()
+            status = message.get("status")
+        
+    # Step 3: Check for attachments
+    
+    attachments = message.get("attachments", [])
+
+    if not attachments:
+        answer = "(No response from Genie)"
+    else:
+        attachment = attachments[0]
+        if "text" in attachment:
+            answer = attachment["text"]["content"]
+        elif "query" in attachment:
+            q = attachment["query"]
+            answer = f"🔍 {q.get('description')}\n\n```sql\n{q.get('query')}\n```"
+        else:
+            answer = "(Unrecognized format)"
+        # Case A: Direct content
+        if "attachment_id" not in attachment:
+            answer = "(No attachment ID found in response)"
+        # Case B: Get via /query-result
+        else:
+            attachment_id = attachment["attachment_id"]
+            result_url = f"{poll_url}/query-result/{attachment_id}"
+            result_resp = requests.get(result_url, headers=HEADERS)
+            if result_resp.status_code != 200:
+                answer = "(Error fetching result from Genie)"
+            else:
+                result = result_resp.json()
+                try:
+                    columns = [col['name'] for col in result['statement_response']['manifest']['schema']['columns']]
+                    data = result['statement_response']['result']['data_array']
+                    df = pd.DataFrame(data, columns=columns)
+                                     
+                except Exception as e:
+                    df = pd.DataFrame()
+                    answer = "No data returned from Genie."
+                    # st.error("❌ Failed to parse result.")
+                    # st.text(str(e))
+                # if "text" in result:
+                #     answer = result["text"]["content"]
+                # elif "query" in result:
+                #     q = result["query"]
+                #     answer = f"🔍 {q.get('description')}\n\n```sql\n{q.get('query')}\n```"
+                # else:
+                #     answer = "(Unsupported format)"
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    df_data.append(df)   
+    # Display response in chat
+    with st.chat_message("assistant"):
+        st.markdown(answer)
+        if df.empty:  
+            st.write("No data returned from Genie.")              
+        else:
+            st.dataframe(df, use_container_width=True)
+
+
+
